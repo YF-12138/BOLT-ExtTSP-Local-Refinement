@@ -1,0 +1,79 @@
+diff --git a/bolt/lib/Passes/ReorderAlgorithm.cpp b/bolt/lib/Passes/ReorderAlgorithm.cpp
+index eb6cfabf4..3d8e64ac9 100644
+--- a/bolt/lib/Passes/ReorderAlgorithm.cpp
++++ b/bolt/lib/Passes/ReorderAlgorithm.cpp
+@@ -16,6 +16,7 @@
+ #include "bolt/Core/BinaryFunction.h"
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Transforms/Utils/CodeLayout.h"
++#include <cmath>
+ #include <queue>
+ #include <random>
+ #include <stack>
+@@ -31,6 +32,12 @@ namespace opts {
+ extern cl::OptionCategory BoltOptCategory;
+ extern cl::opt<bool> NoThreads;
+ 
++// Opt-in post-layout refinement; disabled by default to preserve upstream behavior.
++static cl::opt<bool> ExtTSPRefine(
++    "bolt-ext-tsp-local-refine",
++    cl::desc("Try bounded local swaps after ExtTSP, accepting only score gains"),
++    cl::init(false), cl::cat(BoltOptCategory));
++
+ static cl::opt<unsigned> ColdThreshold(
+     "cold-threshold",
+     cl::desc("tenths of percents of main entry frequency to use as a "
+@@ -550,6 +557,53 @@ void ExtTSPReorderAlgorithm::reorderBasicBlocks(BinaryFunction &BF,
+   // Run the layout algorithm
+   auto Result =
+       codelayout::computeExtTspLayout(BlockSizes, BlockCounts, JumpCounts);
++
++  // Optional, score-guarded local refinement of the ExtTSP result.
++  // Keep block zero (the function entry) fixed. Limit the work to small CFGs.
++  if (opts::ExtTSPRefine && Result.size() >= 4 && Result.size() <= 64) {
++    constexpr unsigned MaxPasses = 2;
++    constexpr size_t SwapWindow = 8;
++    const double InitialScore =
++        codelayout::calcExtTspScore(Result, BlockSizes, JumpCounts);
++    double Score = InitialScore;
++    unsigned AcceptedSwaps = 0;
++    if (std::isfinite(Score)) {
++      for (unsigned Pass = 0; Pass < MaxPasses; ++Pass) {
++        bool Changed = false;
++        for (size_t I = 1; I < Result.size(); ++I) {
++          const double MinGain = 1.0; // Require a positive score improvement
++          size_t BestJ = I;
++          double BestScore = Score;
++          const size_t End = std::min(Result.size(), I + SwapWindow + 1);
++          for (size_t J = I + 1; J < End; ++J) {
++            std::swap(Result[I], Result[J]);
++            const double CandidateScore =
++                codelayout::calcExtTspScore(Result, BlockSizes, JumpCounts);
++            std::swap(Result[I], Result[J]);
++            if (std::isfinite(CandidateScore) &&
++                CandidateScore > BestScore + MinGain) {
++              BestScore = CandidateScore;
++              BestJ = J;
++            }
++          }
++          if (BestJ != I) {
++            std::swap(Result[I], Result[BestJ]);
++            Score = BestScore;
++            ++AcceptedSwaps;
++            Changed = true;
++          }
++        }
++        if (!Changed)
++          break;
++      }
++
++      llvm::errs() << "BOLT-LOCAL-REFINE:"
++                   << " swaps=" << AcceptedSwaps
++                   << " score_before=" << InitialScore
++                   << " score_after=" << Score
++                   << " gain=" << (Score - InitialScore) << '\n';
++    }
++  }
+   Order.reserve(BF.getLayout().block_size());
+   for (uint64_t R : Result)
+     Order.push_back(OrigOrder[R]);
